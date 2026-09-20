@@ -82,8 +82,19 @@
             <div class="form-card">
               <h3>在线留言</h3>
               <p class="form-desc">填写以下表单，我们将尽快与您联系</p>
-              
-              <el-form 
+
+              <el-alert
+                v-if="lastSubmit"
+                :type="lastSubmit.status === 'success' ? 'success' : 'error'"
+                :title="lastSubmit.message"
+                :description="`提交时间：${formatTime(lastSubmit.time)}`"
+                show-icon
+                closable
+                class="submit-result"
+                @close="dismissSubmitResult"
+              />
+
+              <el-form
                 ref="formRef"
                 :model="form" 
                 :rules="rules" 
@@ -179,13 +190,18 @@
 </template>
 
 <script setup>
-import { ref, reactive } from 'vue'
+import { ref, reactive, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import SectionTitle from '@/components/SectionTitle.vue'
+
+const DRAFT_STORAGE_KEY = 'zhiyun_contact_draft'
+const SUBMIT_RESULT_KEY = 'zhiyun_contact_submit_result'
+const SUBMIT_TIMEOUT = 8000
 
 const formRef = ref(null)
 const submitting = ref(false)
 const activeFaq = ref([])
+const lastSubmit = ref(null)
 
 const form = reactive({
   name: '',
@@ -193,6 +209,91 @@ const form = reactive({
   email: '',
   company: '',
   message: ''
+})
+
+// 恢复上次未提交的留言草稿（仅恢复表单字段，不影响联系方式与常见问题展开状态）
+const restoreDraft = () => {
+  try {
+    const raw = localStorage.getItem(DRAFT_STORAGE_KEY)
+    if (!raw) return
+    const draft = JSON.parse(raw)
+    Object.keys(form).forEach((key) => {
+      if (typeof draft[key] === 'string') {
+        form[key] = draft[key]
+      }
+    })
+  } catch {
+    localStorage.removeItem(DRAFT_STORAGE_KEY)
+  }
+}
+
+// 读取上次留言提交结果，用于页面提示
+const loadSubmitResult = () => {
+  try {
+    const raw = localStorage.getItem(SUBMIT_RESULT_KEY)
+    if (raw) {
+      lastSubmit.value = JSON.parse(raw)
+    }
+  } catch {
+    localStorage.removeItem(SUBMIT_RESULT_KEY)
+  }
+}
+
+restoreDraft()
+loadSubmitResult()
+
+// 表单内容变化时实时保存草稿；全部为空时清除草稿
+watch(form, (val) => {
+  const hasContent = Object.values(val).some((v) => v && v.trim())
+  if (hasContent) {
+    localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(val))
+  } else {
+    localStorage.removeItem(DRAFT_STORAGE_KEY)
+  }
+}, { deep: true })
+
+const recordSubmitResult = (status, message) => {
+  const result = { status, message, time: Date.now() }
+  lastSubmit.value = result
+  localStorage.setItem(SUBMIT_RESULT_KEY, JSON.stringify(result))
+}
+
+const dismissSubmitResult = () => {
+  lastSubmit.value = null
+  localStorage.removeItem(SUBMIT_RESULT_KEY)
+}
+
+const formatTime = (time) => {
+  return new Date(time).toLocaleString('zh-CN', { hour12: false })
+}
+
+// 提交成功后清空表单与草稿（手动清空，避免 resetFields 恢复到草稿初始值）
+const clearForm = () => {
+  Object.keys(form).forEach((key) => {
+    form[key] = ''
+  })
+  formRef.value?.clearValidate()
+  localStorage.removeItem(DRAFT_STORAGE_KEY)
+}
+
+// 模拟留言提交请求（实际项目中替换为真实 API 调用）
+const postMessage = (payload) => new Promise((resolve) => {
+  setTimeout(() => resolve({ code: 0, data: payload }), 1500)
+})
+
+// 请求超时包装：超时后拒绝，由调用方保留已填写内容
+const withTimeout = (promise, ms) => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error('timeout')), ms)
+  promise.then(
+    (res) => {
+      clearTimeout(timer)
+      resolve(res)
+    },
+    (err) => {
+      clearTimeout(timer)
+      reject(err)
+    }
+  )
 })
 
 const rules = {
@@ -213,19 +314,33 @@ const rules = {
 }
 
 const handleSubmit = async () => {
-  if (!formRef.value) return
-  
-  await formRef.value.validate((valid) => {
-    if (valid) {
-      submitting.value = true
-      // 模拟提交
-      setTimeout(() => {
-        submitting.value = false
-        ElMessage.success('留言提交成功，我们将尽快与您联系！')
-        formRef.value.resetFields()
-      }, 1500)
-    }
-  })
+  // 提交中重复触发（连点、回车）直接忽略，不影响已填写内容
+  if (!formRef.value || submitting.value) return
+
+  try {
+    await formRef.value.validate()
+  } catch {
+    // 必填缺失或格式错误：保留已填写内容，仅提示
+    ElMessage.warning('请完善必填信息后再提交')
+    return
+  }
+
+  submitting.value = true
+  try {
+    await withTimeout(postMessage({ ...form }), SUBMIT_TIMEOUT)
+    recordSubmitResult('success', '留言提交成功，我们将尽快与您联系！')
+    ElMessage.success('留言提交成功，我们将尽快与您联系！')
+    clearForm()
+  } catch (err) {
+    // 超时或请求失败：保留已填写内容与草稿，记录失败结果
+    const message = err.message === 'timeout'
+      ? '留言提交超时，请检查网络后重试'
+      : '留言提交失败，请稍后重试'
+    recordSubmitResult('error', message)
+    ElMessage.error(`${message}，已为您保留填写内容`)
+  } finally {
+    submitting.value = false
+  }
 }
 
 const faqs = [
@@ -384,6 +499,10 @@ const faqs = [
   .form-desc {
     font-size: $font-size-sm;
     color: $text-secondary;
+    margin-bottom: $spacing-lg;
+  }
+
+  .submit-result {
     margin-bottom: $spacing-lg;
   }
 }
