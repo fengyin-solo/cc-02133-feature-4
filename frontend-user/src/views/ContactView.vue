@@ -82,8 +82,28 @@
             <div class="form-card">
               <h3>在线留言</h3>
               <p class="form-desc">填写以下表单，我们将尽快与您联系</p>
-              
-              <el-form 
+
+              <!-- 上次提交结果反馈（刷新或切换页面后仍可见） -->
+              <el-alert
+                v-if="lastResult"
+                :type="lastResult.type"
+                :title="lastResult.message"
+                :description="`提交时间：${formatTime(lastResult.time)}`"
+                show-icon
+                closable
+                class="result-alert"
+                @close="dismissResult"
+              />
+
+              <!-- 草稿恢复提示 -->
+              <div v-if="draftRestored" class="draft-hint">
+                <span>已为您恢复上次未提交的留言内容</span>
+                <el-button link type="primary" size="small" @click="clearDraft">
+                  清除草稿
+                </el-button>
+              </div>
+
+              <el-form
                 ref="formRef"
                 :model="form" 
                 :rules="rules" 
@@ -179,7 +199,7 @@
 </template>
 
 <script setup>
-import { ref, reactive } from 'vue'
+import { ref, reactive, watch, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
 import SectionTitle from '@/components/SectionTitle.vue'
 
@@ -212,20 +232,143 @@ const rules = {
   ]
 }
 
-const handleSubmit = async () => {
-  if (!formRef.value) return
-  
-  await formRef.value.validate((valid) => {
-    if (valid) {
-      submitting.value = true
-      // 模拟提交
-      setTimeout(() => {
-        submitting.value = false
-        ElMessage.success('留言提交成功，我们将尽快与您联系！')
-        formRef.value.resetFields()
-      }, 1500)
-    }
+// ---------- 草稿保全与提交反馈 ----------
+const DRAFT_KEY = 'contact_message_draft'
+const RESULT_KEY = 'contact_message_last_result'
+const REQUEST_TIMEOUT = 10000
+// 仅这五个字段参与草稿保存/恢复，联系方式与常见问题展开状态不受影响
+const FORM_FIELDS = ['name', 'phone', 'email', 'company', 'message']
+
+const draftRestored = ref(false)
+const lastResult = ref(null)
+
+const pickDraft = (source) => {
+  const draft = {}
+  FORM_FIELDS.forEach(key => {
+    draft[key] = typeof source[key] === 'string' ? source[key] : ''
   })
+  return draft
+}
+
+const hasDraftContent = (source) =>
+  FORM_FIELDS.some(key => source[key] && source[key].trim())
+
+// 恢复草稿：只回填表单字段，不触碰 activeFaq 等其他状态
+const restoreDraft = () => {
+  try {
+    const raw = localStorage.getItem(DRAFT_KEY)
+    if (!raw) return
+    const draft = JSON.parse(raw)
+    FORM_FIELDS.forEach(key => {
+      if (typeof draft[key] === 'string') {
+        form[key] = draft[key]
+      }
+    })
+    draftRestored.value = hasDraftContent(draft)
+  } catch {
+    localStorage.removeItem(DRAFT_KEY)
+  }
+}
+
+const loadLastResult = () => {
+  try {
+    const raw = localStorage.getItem(RESULT_KEY)
+    if (raw) lastResult.value = JSON.parse(raw)
+  } catch {
+    localStorage.removeItem(RESULT_KEY)
+  }
+}
+
+const recordResult = (type, message) => {
+  const record = { type, message, time: Date.now() }
+  lastResult.value = record
+  localStorage.setItem(RESULT_KEY, JSON.stringify(record))
+}
+
+const dismissResult = () => {
+  lastResult.value = null
+  localStorage.removeItem(RESULT_KEY)
+}
+
+const clearDraft = () => {
+  localStorage.removeItem(DRAFT_KEY)
+  draftRestored.value = false
+  if (formRef.value) formRef.value.resetFields()
+}
+
+// 输入变化时自动保存草稿（防抖），全部清空时移除草稿
+let saveTimer = null
+watch(form, (val) => {
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => {
+    if (hasDraftContent(val)) {
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(pickDraft(val)))
+    } else {
+      localStorage.removeItem(DRAFT_KEY)
+      draftRestored.value = false
+    }
+  }, 300)
+}, { deep: true })
+
+onMounted(() => {
+  restoreDraft()
+  loadLastResult()
+})
+
+onBeforeUnmount(() => {
+  clearTimeout(saveTimer)
+})
+
+const formatTime = (ts) => {
+  const d = new Date(ts)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+// 模拟提交请求
+const submitApi = (payload) => new Promise((resolve) => {
+  setTimeout(() => resolve(payload), 1500)
+})
+
+// 超时保护：超过 REQUEST_TIMEOUT 视为请求超时
+const withTimeout = (promise, ms) => Promise.race([
+  promise,
+  new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('REQUEST_TIMEOUT')), ms)
+  })
+])
+
+const handleSubmit = async () => {
+  // 防止重复提交（含回车触发的表单提交）
+  if (!formRef.value || submitting.value) return
+
+  try {
+    await formRef.value.validate()
+  } catch {
+    // 必填缺失：保留已填内容，仅提示
+    ElMessage.warning('请完善必填信息后再提交')
+    return
+  }
+
+  submitting.value = true
+  try {
+    await withTimeout(submitApi(pickDraft(form)), REQUEST_TIMEOUT)
+    // 提交成功：清空表单与草稿，记录成功反馈
+    formRef.value.resetFields()
+    localStorage.removeItem(DRAFT_KEY)
+    draftRestored.value = false
+    recordResult('success', '留言提交成功，我们将尽快与您联系！')
+    ElMessage.success('留言提交成功，我们将尽快与您联系！')
+  } catch (err) {
+    // 提交失败/请求超时：保留已填写的字段，记录失败反馈
+    const message = err && err.message === 'REQUEST_TIMEOUT'
+      ? '请求超时，请检查网络后重试'
+      : '留言提交失败，请稍后重试'
+    recordResult('error', message)
+    ElMessage.error(`${message}，已填写的内容已为您保留`)
+  } finally {
+    submitting.value = false
+  }
 }
 
 const faqs = [
@@ -386,6 +529,22 @@ const faqs = [
     color: $text-secondary;
     margin-bottom: $spacing-lg;
   }
+
+  .result-alert {
+    margin-bottom: $spacing-md;
+  }
+}
+
+.draft-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: $spacing-xs $spacing-md;
+  margin-bottom: $spacing-md;
+  background: rgba($primary-color, 0.06);
+  border-radius: $radius-sm;
+  font-size: $font-size-xs;
+  color: $text-secondary;
 }
 
 .map-section {
